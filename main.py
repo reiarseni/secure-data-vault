@@ -49,6 +49,7 @@ def decrypt_title(blob: bytes, key: bytes) -> str:
     Decrypts the blob to retrieve the plain title.
     Expects blob formatted as nonce (12) + tag (16) + ciphertext.
     """
+    blob = bytes(blob)  # Ensure blob is a bytes object (handles memoryview from SQLite)
     nonce = blob[:12]
     tag = blob[12:28]
     ciphertext = blob[28:]
@@ -130,7 +131,7 @@ class DataManager:
         """
         new_encrypted = encrypt_title(new_title, self.encryption_key)
         cur = self.conn.cursor()
-        cur.execute("UPDATE title SET title = ? WHERE key = ?", (new_encrypted, key))
+        cur.execute("UPDATE title SET title = ? WHERE key = ?", (sqlite3.Binary(new_encrypted), key))
         self.conn.commit()
 
     def add_item(self, title: str, content: str):
@@ -141,12 +142,12 @@ class DataManager:
         key = secrets.token_hex(25)  # 50 hex characters
         encrypted_title = encrypt_title(title, self.encryption_key)
         cur = self.conn.cursor()
-        cur.execute("INSERT INTO title (key, title) VALUES (?, ?)", (key, encrypted_title))
+        cur.execute("INSERT INTO title (key, title) VALUES (?, ?)", (key, sqlite3.Binary(encrypted_title)))
         # Encrypt content separately (nonce, tag, and ciphertext stored separately)
         nonce, tag, ciphertext = encrypt_data(content.encode('utf-8'), self.encryption_key)
         cur.execute(
             "INSERT INTO value_key (key, content, nonce, etiqueta) VALUES (?, ?, ?, ?)",
-            (key, ciphertext, nonce, tag)
+            (key, sqlite3.Binary(ciphertext), nonce, tag)
         )
         self.conn.commit()
 
@@ -176,6 +177,7 @@ class DataManager:
         row = cur.fetchone()
         if row:
             ciphertext, nonce, tag = row
+            ciphertext = bytes(ciphertext)
             return decrypt_data(nonce, tag, ciphertext, derived_key).decode('utf-8')
         else:
             return ""
@@ -192,15 +194,16 @@ class DataManager:
         for key, encrypted_blob in cur.fetchall():
             title_text = decrypt_title(encrypted_blob, self.encryption_key)
             new_encrypted_title = encrypt_title(title_text, new_encryption_key)
-            cur.execute("UPDATE title SET title = ? WHERE key = ?", (new_encrypted_title, key))
+            cur.execute("UPDATE title SET title = ? WHERE key = ?", (sqlite3.Binary(new_encrypted_title), key))
         # Update contents in 'value_key'
         cur.execute("SELECT key, content, nonce, etiqueta FROM value_key")
         for key, ciphertext, nonce, tag in cur.fetchall():
+            ciphertext = bytes(ciphertext)
             content_text = decrypt_data(nonce, tag, ciphertext, self.encryption_key).decode('utf-8')
             new_nonce, new_tag, new_ciphertext = encrypt_data(content_text.encode('utf-8'), new_encryption_key)
             cur.execute(
                 "UPDATE value_key SET content = ?, nonce = ?, etiqueta = ? WHERE key = ?",
-                (new_ciphertext, new_nonce, new_tag, key)
+                (sqlite3.Binary(new_ciphertext), new_nonce, new_tag, key)
             )
         # Update the master key hash in 'hash'
         new_hash = hashlib.sha256(new_encryption_key).hexdigest()
