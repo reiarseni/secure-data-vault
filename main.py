@@ -1,4 +1,5 @@
 import sys
+import os
 import sqlite3
 import secrets
 import hashlib
@@ -10,6 +11,8 @@ from PyQt5.QtCore import Qt, QSortFilterProxyModel
 from PyQt5.QtGui import QStandardItemModel, QStandardItem
 from Crypto.Cipher import AES
 from Crypto.Protocol.KDF import PBKDF2
+from Crypto.Hash import SHA512
+
 
 # ------------------ Encryption Utilities ------------------
 
@@ -22,12 +25,14 @@ def encrypt_data(plain_text: bytes, key: bytes) -> (bytes, bytes, bytes):
     ciphertext, tag = cipher.encrypt_and_digest(plain_text)
     return cipher.nonce, tag, ciphertext
 
+
 def decrypt_data(nonce: bytes, tag: bytes, ciphertext: bytes, key: bytes) -> bytes:
     """
     Decrypts ciphertext using AES-256-GCM with given nonce and tag.
     """
     cipher = AES.new(key, AES.MODE_GCM, nonce=nonce)
     return cipher.decrypt_and_verify(ciphertext, tag)
+
 
 def encrypt_title(title: str, key: bytes) -> bytes:
     """
@@ -38,6 +43,7 @@ def encrypt_title(title: str, key: bytes) -> bytes:
     nonce, tag, ciphertext = encrypt_data(data, key)
     return nonce + tag + ciphertext
 
+
 def decrypt_title(blob: bytes, key: bytes) -> str:
     """
     Decrypts the blob to retrieve the plain title.
@@ -47,6 +53,31 @@ def decrypt_title(blob: bytes, key: bytes) -> str:
     tag = blob[12:28]
     ciphertext = blob[28:]
     return decrypt_data(nonce, tag, ciphertext, key).decode('utf-8')
+
+
+# ------------------ Database Setup Utility ------------------
+
+def create_tables(conn):
+    cursor = conn.cursor()
+    cursor.execute("CREATE TABLE IF NOT EXISTS hash (id INTEGER PRIMARY KEY AUTOINCREMENT, password_hash TEXT)")
+    cursor.execute("CREATE TABLE IF NOT EXISTS title (key TEXT PRIMARY KEY, title BLOB)")
+    cursor.execute(
+        "CREATE TABLE IF NOT EXISTS value_key (key TEXT PRIMARY KEY, content BLOB, nonce BLOB, etiqueta BLOB)")
+    conn.commit()
+
+
+def master_key_exists(db_path: str) -> bool:
+    conn = sqlite3.connect(db_path)
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT COUNT(*) FROM hash")
+        count = cur.fetchone()[0]
+        return count > 0
+    except Exception:
+        return False
+    finally:
+        conn.close()
+
 
 # ------------------ Data Manager ------------------
 
@@ -59,41 +90,38 @@ class DataManager:
         self.SALT = b'static_salt'
         # Derive encryption key using PBKDF2 (in production, consider using Argon2id)
         self.master_key_bytes = master_key.encode('utf-8')
-        self.encryption_key = PBKDF2(self.master_key_bytes, self.SALT, dkLen=32, count=100000, hmac_hash_module=hashlib.sha512)
+        self.encryption_key = PBKDF2(self.master_key_bytes, self.SALT, dkLen=32, count=100000, hmac_hash_module=SHA512)
         if not self.verify_master_key():
             raise ValueError("Master key verification failed.")
 
     def verify_master_key(self) -> bool:
         """
-        Verifies the provided master key against the stored hash in 'clave_maestra'.
-        If it does not exist, store it (first use).
+        Verifies the provided master key against the stored hash in 'hash'.
+        If no master key exists, an error is raised.
         """
         cur = self.conn.cursor()
-        cur.execute("SELECT hash_clave FROM clave_maestra LIMIT 1")
+        cur.execute("SELECT password_hash FROM hash LIMIT 1")
         row = cur.fetchone()
         computed_hash = hashlib.sha256(self.encryption_key).hexdigest()
         if row:
             stored_hash = row[0]
             return computed_hash == stored_hash
         else:
-            # First time: store the hash of the master key
-            cur.execute("INSERT INTO clave_maestra (hash_clave) VALUES (?)", (computed_hash,))
-            self.conn.commit()
-            return True
+            raise ValueError("No master key set. Please set a new master key.")
 
     def load_titles(self) -> list:
         """
-        Loads all items from 'indice', decrypts the titles and returns a list of tuples (key, title).
+        Loads all items from 'title', decrypts the titles and returns a list of tuples (key, title).
         """
         cur = self.conn.cursor()
-        cur.execute("SELECT key, titulo_encriptado FROM indice")
+        cur.execute("SELECT key, title FROM title")
         titles = []
         for key, encrypted_blob in cur.fetchall():
             try:
-                title = decrypt_title(encrypted_blob, self.encryption_key)
+                title_text = decrypt_title(encrypted_blob, self.encryption_key)
             except Exception:
-                title = "Decryption Error"
-            titles.append((key, title))
+                title_text = "Decryption Error"
+            titles.append((key, title_text))
         return titles
 
     def update_title(self, key: str, new_title: str):
@@ -102,7 +130,7 @@ class DataManager:
         """
         new_encrypted = encrypt_title(new_title, self.encryption_key)
         cur = self.conn.cursor()
-        cur.execute("UPDATE indice SET titulo_encriptado = ? WHERE key = ?", (new_encrypted, key))
+        cur.execute("UPDATE title SET title = ? WHERE key = ?", (new_encrypted, key))
         self.conn.commit()
 
     def add_item(self, title: str, content: str):
@@ -113,11 +141,11 @@ class DataManager:
         key = secrets.token_hex(25)  # 50 hex characters
         encrypted_title = encrypt_title(title, self.encryption_key)
         cur = self.conn.cursor()
-        cur.execute("INSERT INTO indice (key, titulo_encriptado) VALUES (?, ?)", (key, encrypted_title))
+        cur.execute("INSERT INTO title (key, title) VALUES (?, ?)", (key, encrypted_title))
         # Encrypt content separately (nonce, tag, and ciphertext stored separately)
         nonce, tag, ciphertext = encrypt_data(content.encode('utf-8'), self.encryption_key)
         cur.execute(
-            "INSERT INTO clave_valor (key, contenido_encriptado, nonce, etiqueta) VALUES (?, ?, ?, ?)",
+            "INSERT INTO value_key (key, content, nonce, etiqueta) VALUES (?, ?, ?, ?)",
             (key, ciphertext, nonce, tag)
         )
         self.conn.commit()
@@ -127,8 +155,8 @@ class DataManager:
         Deletes an item (both title and content) from the database.
         """
         cur = self.conn.cursor()
-        cur.execute("DELETE FROM clave_valor WHERE key = ?", (key,))
-        cur.execute("DELETE FROM indice WHERE key = ?", (key,))
+        cur.execute("DELETE FROM value_key WHERE key = ?", (key,))
+        cur.execute("DELETE FROM title WHERE key = ?", (key,))
         self.conn.commit()
 
     def decrypt_content(self, key: str, provided_master_key: str) -> str:
@@ -137,14 +165,14 @@ class DataManager:
         Requires the user to re-enter the master key.
         """
         provided_key = provided_master_key.encode('utf-8')
-        derived_key = PBKDF2(provided_key, self.SALT, dkLen=32, count=100000, hmac_hash_module=hashlib.sha512)
+        derived_key = PBKDF2(provided_key, self.SALT, dkLen=32, count=100000, hmac_hash_module=SHA512)
         computed_hash = hashlib.sha256(derived_key).hexdigest()
         cur = self.conn.cursor()
-        cur.execute("SELECT hash_clave FROM clave_maestra LIMIT 1")
+        cur.execute("SELECT password_hash FROM hash LIMIT 1")
         row = cur.fetchone()
         if row and computed_hash != row[0]:
             raise ValueError("Invalid master key for content decryption.")
-        cur.execute("SELECT contenido_encriptado, nonce, etiqueta FROM clave_valor WHERE key = ?", (key,))
+        cur.execute("SELECT content, nonce, etiqueta FROM value_key WHERE key = ?", (key,))
         row = cur.fetchone()
         if row:
             ciphertext, nonce, tag = row
@@ -157,32 +185,69 @@ class DataManager:
         Changes the master key: decrypts all items with the old key and re-encrypts them with the new key.
         """
         new_key_bytes = new_master_key.encode('utf-8')
-        new_encryption_key = PBKDF2(new_key_bytes, self.SALT, dkLen=32, count=100000, hmac_hash_module=hashlib.sha512)
+        new_encryption_key = PBKDF2(new_key_bytes, self.SALT, dkLen=32, count=100000, hmac_hash_module=SHA512)
         cur = self.conn.cursor()
-        # Update titles in 'indice'
-        cur.execute("SELECT key, titulo_encriptado FROM indice")
+        # Update titles in 'title'
+        cur.execute("SELECT key, title FROM title")
         for key, encrypted_blob in cur.fetchall():
-            title = decrypt_title(encrypted_blob, self.encryption_key)
-            new_encrypted_title = encrypt_title(title, new_encryption_key)
-            cur.execute("UPDATE indice SET titulo_encriptado = ? WHERE key = ?", (new_encrypted_title, key))
-        # Update contents in 'clave_valor'
-        cur.execute("SELECT key, contenido_encriptado, nonce, etiqueta FROM clave_valor")
+            title_text = decrypt_title(encrypted_blob, self.encryption_key)
+            new_encrypted_title = encrypt_title(title_text, new_encryption_key)
+            cur.execute("UPDATE title SET title = ? WHERE key = ?", (new_encrypted_title, key))
+        # Update contents in 'value_key'
+        cur.execute("SELECT key, content, nonce, etiqueta FROM value_key")
         for key, ciphertext, nonce, tag in cur.fetchall():
-            content = decrypt_data(nonce, tag, ciphertext, self.encryption_key).decode('utf-8')
-            new_nonce, new_tag, new_ciphertext = encrypt_data(content.encode('utf-8'), new_encryption_key)
+            content_text = decrypt_data(nonce, tag, ciphertext, self.encryption_key).decode('utf-8')
+            new_nonce, new_tag, new_ciphertext = encrypt_data(content_text.encode('utf-8'), new_encryption_key)
             cur.execute(
-                "UPDATE clave_valor SET contenido_encriptado = ?, nonce = ?, etiqueta = ? WHERE key = ?",
+                "UPDATE value_key SET content = ?, nonce = ?, etiqueta = ? WHERE key = ?",
                 (new_ciphertext, new_nonce, new_tag, key)
             )
-        # Update the master key hash in 'clave_maestra'
+        # Update the master key hash in 'hash'
         new_hash = hashlib.sha256(new_encryption_key).hexdigest()
-        cur.execute("UPDATE clave_maestra SET hash_clave = ? WHERE id = 1", (new_hash,))
+        cur.execute("UPDATE hash SET password_hash = ? WHERE id = 1", (new_hash,))
         self.conn.commit()
         # Replace in-memory key (secure deletion pending for production)
         self.master_key_bytes = new_key_bytes
         self.encryption_key = new_encryption_key
 
+
 # ------------------ PyQt Dialogs and Windows ------------------
+
+class NewMasterPasswordDialog(QDialog):
+    def __init__(self, db_path: str):
+        super().__init__()
+        self.setWindowTitle("Set Initial Master Key")
+        self.db_path = db_path
+        layout = QVBoxLayout()
+        layout.addWidget(QLabel("Enter new master key:"))
+        self.key_edit = QLineEdit()
+        self.key_edit.setEchoMode(QLineEdit.Password)
+        layout.addWidget(self.key_edit)
+        self.set_btn = QPushButton("Set Password")
+        self.set_btn.clicked.connect(self.set_password)
+        layout.addWidget(self.set_btn)
+        self.setLayout(layout)
+
+    def set_password(self):
+        new_key = self.key_edit.text()
+        if not new_key:
+            QMessageBox.warning(self, "Warning", "Master key cannot be empty.")
+            return
+        try:
+            salt = b'static_salt'
+            encryption_key = PBKDF2(new_key.encode('utf-8'), salt, dkLen=32, count=100000, hmac_hash_module=SHA512)
+            computed_hash = hashlib.sha256(encryption_key).hexdigest()
+            conn = sqlite3.connect(self.db_path)
+            create_tables(conn)  # Ensure tables exist before inserting
+            cur = conn.cursor()
+            cur.execute("INSERT INTO hash (password_hash) VALUES (?)", (computed_hash,))
+            conn.commit()
+            conn.close()
+            QMessageBox.information(self, "Success", "Master key set successfully.")
+            self.accept()
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to set master key: {str(e)}")
+
 
 class LoginDialog(QDialog):
     def __init__(self, db_path: str):
@@ -220,6 +285,7 @@ class LoginDialog(QDialog):
         # Allows changing the master key even from the login dialog.
         dlg = ChangeMasterKeyDialog(self.db_path)
         dlg.exec_()
+
 
 class MainWindow(QMainWindow):
     def __init__(self, data_manager: DataManager):
@@ -280,11 +346,11 @@ class MainWindow(QMainWindow):
         """
         self.model.removeRows(0, self.model.rowCount())
         self.item_data = {}
-        for key, title in self.data_manager.load_titles():
-            self.item_data[key] = title
+        for key, title_text in self.data_manager.load_titles():
+            self.item_data[key] = title_text
             key_item = QStandardItem(key)
             key_item.setEditable(False)
-            title_item = QStandardItem(title)
+            title_item = QStandardItem(title_text)
             self.model.appendRow([key_item, title_item])
         if not self.item_data:
             # Show message in table if no results
@@ -332,7 +398,8 @@ class MainWindow(QMainWindow):
             # Map proxy index to source index
             source_index = self.proxy_model.mapToSource(index)
             key = self.model.item(source_index.row(), 0).text()
-            if QMessageBox.question(self, "Confirm Delete", "Are you sure you want to delete this item?") == QMessageBox.Yes:
+            if QMessageBox.question(self, "Confirm Delete",
+                                    "Are you sure you want to delete this item?") == QMessageBox.Yes:
                 try:
                     self.data_manager.delete_item(key)
                     self.load_items()
@@ -354,6 +421,7 @@ class MainWindow(QMainWindow):
             dlg.exec_()
         else:
             QMessageBox.information(self, "No Selection", "Please select an item to view its content.")
+
 
 class ContentDialog(QDialog):
     def __init__(self, data_manager: DataManager, key: str):
@@ -380,6 +448,7 @@ class ContentDialog(QDialog):
             self.content_label.setText(f"Content:\n{content}")
         except Exception as e:
             QMessageBox.critical(self, "Decryption Failed", f"Could not decrypt content: {str(e)}")
+
 
 class ChangeMasterKeyDialog(QDialog):
     def __init__(self, db_path: str):
@@ -412,14 +481,62 @@ class ChangeMasterKeyDialog(QDialog):
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to change master key: {str(e)}")
 
+
+class InitializationDialog(QDialog):
+    def __init__(self, db_path: str):
+        super().__init__()
+        self.setWindowTitle("Database Initialization")
+        self.db_path = db_path
+        layout = QVBoxLayout()
+        layout.addWidget(QLabel("Enter initial master key:"))
+        self.key_edit = QLineEdit()
+        self.key_edit.setEchoMode(QLineEdit.Password)
+        layout.addWidget(self.key_edit)
+        self.init_btn = QPushButton("Initialize Database")
+        self.init_btn.clicked.connect(self.initialize_db)
+        layout.addWidget(self.init_btn)
+        self.setLayout(layout)
+
+    def initialize_db(self):
+        master_key = self.key_edit.text()
+        if not master_key:
+            QMessageBox.warning(self, "Warning", "Master key cannot be empty.")
+            return
+        try:
+            conn = sqlite3.connect(self.db_path)
+            create_tables(conn)
+            conn.close()
+            # Instantiate DataManager to trigger master key insertion via verification
+            dm = DataManager(self.db_path, master_key)
+            QMessageBox.information(self, "Success", "Database initialized successfully.")
+            self.accept()
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to initialize database: {str(e)}")
+
+
 # ------------------ Main Application ------------------
 
 if __name__ == '__main__':
-    # Make sure that the database exists and the required tables are created.
-    # It is assumed that the file 'secure_items.db' already has the tables defined according to the schema.
+    # It is assumed that the file 'secure_items.db' will be created if it does not exist.
     DB_PATH = "secure_items.db"
-
     app = QApplication(sys.argv)
+
+    if not os.path.exists(DB_PATH):
+        init_dialog = InitializationDialog(DB_PATH)
+        if init_dialog.exec_() != QDialog.Accepted:
+            sys.exit(0)
+
+    # Ensure the database has the required tables even if the file exists but is empty
+    conn = sqlite3.connect(DB_PATH)
+    create_tables(conn)
+    conn.close()
+
+    # Check if a master key is set in the database; if not, prompt for a new master key.
+    if not master_key_exists(DB_PATH):
+        new_key_dialog = NewMasterPasswordDialog(DB_PATH)
+        if new_key_dialog.exec_() != QDialog.Accepted:
+            sys.exit(0)
+
     login = LoginDialog(DB_PATH)
     if login.exec_() == QDialog.Accepted:
         main_window = MainWindow(login.data_manager)
