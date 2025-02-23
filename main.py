@@ -5,7 +5,7 @@ import secrets
 import hashlib
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QDialog, QVBoxLayout, QHBoxLayout,
-    QLineEdit, QLabel, QPushButton, QMessageBox, QTableView, QWidget, QInputDialog
+    QLineEdit, QLabel, QPushButton, QMessageBox, QTableView, QWidget, QInputDialog, QAbstractItemView
 )
 from PyQt5.QtCore import Qt, QSortFilterProxyModel
 from PyQt5.QtGui import QStandardItemModel, QStandardItem
@@ -306,6 +306,8 @@ class MainWindow(QMainWindow):
 
         # QTableView to show decrypted titles
         self.table_view = QTableView()
+        # Set selection behavior to select entire rows
+        self.table_view.setSelectionBehavior(QAbstractItemView.SelectRows)
         layout.addWidget(self.table_view)
 
         # Standard model to hold the items
