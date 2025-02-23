@@ -94,6 +94,8 @@ class DataManager:
         self.encryption_key = PBKDF2(self.master_key_bytes, self.SALT, dkLen=32, count=100000, hmac_hash_module=SHA512)
         if not self.verify_master_key():
             raise ValueError("Master key verification failed.")
+        # Load decrypted titles into in-memory cache
+        self.load_titles_cache()
 
     def verify_master_key(self) -> bool:
         """
@@ -110,34 +112,41 @@ class DataManager:
         else:
             raise ValueError("No master key set. Please set a new master key.")
 
-    def load_titles(self) -> list:
+    def load_titles_cache(self):
         """
-        Loads all items from 'title', decrypts the titles and returns a list of tuples (key, title).
+        Loads all decrypted titles from the database into an in-memory cache.
         """
         cur = self.conn.cursor()
         cur.execute("SELECT key, title FROM title")
-        titles = []
+        self.titles_cache = {}
         for key, encrypted_blob in cur.fetchall():
             try:
                 title_text = decrypt_title(encrypted_blob, self.encryption_key)
             except Exception:
                 title_text = "Decryption Error"
-            titles.append((key, title_text))
-        return titles
+            self.titles_cache[key] = title_text
+
+    def load_titles(self) -> list:
+        """
+        Returns all items from the in-memory titles cache as a list of tuples (key, title).
+        """
+        return list(self.titles_cache.items())
 
     def update_title(self, key: str, new_title: str):
         """
-        Updates (re-encrypts) the title for a given key.
+        Updates (re-encrypts) the title for a given key and synchronizes the in-memory cache.
         """
         new_encrypted = encrypt_title(new_title, self.encryption_key)
         cur = self.conn.cursor()
         cur.execute("UPDATE title SET title = ? WHERE key = ?", (sqlite3.Binary(new_encrypted), key))
         self.conn.commit()
+        if hasattr(self, 'titles_cache'):
+            self.titles_cache[key] = new_title
 
     def add_item(self, title: str, content: str):
         """
         Adds a new item with encrypted title and content.
-        Generates a random 50-character key.
+        Generates a random 50-character key and updates the in-memory cache.
         """
         key = secrets.token_hex(25)  # 50 hex characters
         encrypted_title = encrypt_title(title, self.encryption_key)
@@ -150,15 +159,19 @@ class DataManager:
             (key, sqlite3.Binary(ciphertext), nonce, tag)
         )
         self.conn.commit()
+        if hasattr(self, 'titles_cache'):
+            self.titles_cache[key] = title
 
     def delete_item(self, key: str):
         """
-        Deletes an item (both title and content) from the database.
+        Deletes an item (both title and content) from the database and updates the in-memory cache.
         """
         cur = self.conn.cursor()
         cur.execute("DELETE FROM value_key WHERE key = ?", (key,))
         cur.execute("DELETE FROM title WHERE key = ?", (key,))
         self.conn.commit()
+        if hasattr(self, 'titles_cache') and key in self.titles_cache:
+            del self.titles_cache[key]
 
     def decrypt_content(self, key: str, provided_master_key: str) -> str:
         """
@@ -185,6 +198,7 @@ class DataManager:
     def change_master_key(self, new_master_key: str):
         """
         Changes the master key: decrypts all items with the old key and re-encrypts them with the new key.
+        Also reloads the in-memory titles cache.
         """
         new_key_bytes = new_master_key.encode('utf-8')
         new_encryption_key = PBKDF2(new_key_bytes, self.SALT, dkLen=32, count=100000, hmac_hash_module=SHA512)
@@ -212,6 +226,8 @@ class DataManager:
         # Replace in-memory key (secure deletion pending for production)
         self.master_key_bytes = new_key_bytes
         self.encryption_key = new_encryption_key
+        # Reload in-memory titles cache after key change
+        self.load_titles_cache()
 
 
 # ------------------ PyQt Dialogs and Windows ------------------
@@ -347,7 +363,7 @@ class MainWindow(QMainWindow):
 
     def load_items(self):
         """
-        Loads items from the database into the model.
+        Loads items from the in-memory cache into the model.
         """
         self.model.removeRows(0, self.model.rowCount())
         self.item_data = {}
@@ -363,18 +379,26 @@ class MainWindow(QMainWindow):
 
     def handle_item_changed(self, item: QStandardItem):
         """
-        When editing a title inline, update the database.
+        When editing a title inline, prompt for master key and update the database and synchronize the in-memory cache.
         """
         if item.column() == 1:
             # Retrieve the key of the item (column 0 of the same row)
             key = self.model.item(item.row(), 0).text()
             new_title = item.text()
+            # Prompt for master key confirmation before saving
+            master_key, ok = QInputDialog.getText(self, "Confirm Save", "Re-enter master key:", QLineEdit.Password)
+            if not ok or not master_key:
+                QMessageBox.warning(self, "Update Cancelled", "Master key is required to save changes.")
+                self.load_items()
+                return
             try:
+                derived_key = PBKDF2(master_key.encode('utf-8'), self.data_manager.SALT, dkLen=32, count=100000, hmac_hash_module=SHA512)
+                if hashlib.sha256(derived_key).hexdigest() != hashlib.sha256(self.data_manager.encryption_key).hexdigest():
+                    raise ValueError("Incorrect master key")
                 self.data_manager.update_title(key, new_title)
                 self.item_data[key] = new_title
             except Exception as e:
                 QMessageBox.warning(self, "Update Failed", f"Could not update title: {str(e)}")
-                # Reload items in case of error
                 self.load_items()
 
     def add_item(self):
@@ -395,7 +419,7 @@ class MainWindow(QMainWindow):
 
     def delete_item(self):
         """
-        Deletes the currently selected item.
+        Deletes the currently selected item and updates the in-memory cache.
         """
         indexes = self.table_view.selectionModel().selectedRows()
         if indexes:
